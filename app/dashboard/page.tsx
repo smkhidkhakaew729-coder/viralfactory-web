@@ -19,6 +19,7 @@ const features = [
   { icon: '🤝', label: 'Affiliate', desc: 'จัดการ Affiliate Links', href: '/dashboard/affiliate' },
   { icon: '✂️', label: 'Video Editor', desc: 'ตัดต่อวิดีโอ', href: '/dashboard/editor' },
   { icon: '🚀', label: 'Auto-Post', desc: 'โพสต์ Facebook อัตโนมัติ', href: '/dashboard/autopost' },
+  { icon: '⚡', label: 'Auto Pipeline', desc: 'กดเดียว AI ทำทุกอย่างเอง', href: '/dashboard/autopipeline' },
 ]
 
 export default function DashboardPage() {
