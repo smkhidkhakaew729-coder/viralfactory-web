@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { createClient } from '@/lib/supabase'
+import { useStore } from '@/lib/store'
 import type { User } from '@supabase/supabase-js'
 
 const features = [
@@ -22,6 +23,7 @@ const features = [
 
 export default function DashboardPage() {
   const router = useRouter()
+  const { project, setProject, projects, loadProjects } = useStore()
   const [user, setUser] = useState<User | null>(null)
   const [loading, setLoading] = useState(true)
 
@@ -33,6 +35,7 @@ export default function DashboardPage() {
       } else {
         setUser(data.user)
         setLoading(false)
+        loadProjects()
       }
     })
   }, [router])
@@ -104,7 +107,41 @@ export default function DashboardPage() {
           ))}
         </div>
 
-        <div className="mt-10 p-5 rounded-xl" style={{background:'rgba(124,58,237,0.1)',border:'1px solid rgba(124,58,237,0.3)'}}>
+        {/* Current Project */}
+        {project.topic && (
+          <div className="mt-8 p-5 rounded-xl" style={{background:'rgba(124,58,237,0.1)',border:'1px solid rgba(124,58,237,0.3)'}}>
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-purple-300 font-semibold">⚡ Project ปัจจุบัน</span>
+              <button onClick={() => setProject({ topic:'', script:'', storyboard:[], characters:[], title:'' })}
+                className="text-xs text-gray-500 hover:text-gray-300">เริ่มใหม่</button>
+            </div>
+            <p className="text-white font-bold">{project.title || project.topic}</p>
+            <div className="flex gap-3 mt-3 text-xs">
+              {project.script && <span className="text-green-400">✅ Script</span>}
+              {project.storyboard?.length > 0 && <span className="text-green-400">✅ Storyboard</span>}
+              {project.characters?.length > 0 && <span className="text-green-400">✅ Characters</span>}
+            </div>
+          </div>
+        )}
+
+        {/* Recent Projects */}
+        {projects.length > 0 && (
+          <div className="mt-6">
+            <h3 className="text-white font-semibold mb-3">📁 Projects ล่าสุด</h3>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              {projects.slice(0,3).map((p: any) => (
+                <button key={p.id} onClick={() => setProject(p)}
+                  className="p-4 rounded-xl text-left hover:border-purple-500/50 transition"
+                  style={{background:'rgba(255,255,255,0.04)',border:'1px solid rgba(255,255,255,0.08)'}}>
+                  <p className="text-white font-semibold text-sm truncate">{p.title}</p>
+                  <p className="text-gray-500 text-xs mt-1">{new Date(p.updated_at).toLocaleDateString('th-TH')}</p>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div className="mt-6 p-5 rounded-xl" style={{background:'rgba(124,58,237,0.1)',border:'1px solid rgba(124,58,237,0.3)'}}>
           <p className="text-purple-300 text-sm">
             💡 ใส่ API Keys ในหน้า <Link href="/dashboard/settings" className="underline">Settings</Link> เพื่อเริ่มใช้งาน AI features ครบทุกฟีเจอร์
           </p>

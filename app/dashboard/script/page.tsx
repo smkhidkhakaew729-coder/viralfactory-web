@@ -1,20 +1,25 @@
 'use client'
 import { useState } from 'react'
 import Link from 'next/link'
+import { useRouter } from 'next/navigation'
+import { useStore } from '@/lib/store'
 
 export default function ScriptPage() {
-  const [topic, setTopic] = useState('')
+  const router = useRouter()
+  const { project, setProject, saveProject } = useStore()
+  const [topic, setTopic] = useState(project.topic || '')
   const [duration, setDuration] = useState('60')
   const [style, setStyle] = useState('ดราม่า')
   const [loading, setLoading] = useState(false)
-  const [script, setScript] = useState('')
+  const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
 
   async function generate() {
     const key = localStorage.getItem('vf_gemini_key')
     if (!key) { setError('กรุณาใส่ Gemini API Key ในหน้า Settings ก่อน'); return }
     if (!topic) { setError('กรุณาใส่หัวข้อก่อน'); return }
-    setLoading(true); setError(''); setScript('')
+    setLoading(true); setError('')
+    setProject({ topic, script: '' })
     try {
       const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key}`, {
         method: 'POST',
@@ -22,9 +27,17 @@ export default function ScriptPage() {
         body: JSON.stringify({ contents: [{ parts: [{ text: `เขียนสคริปต์วิดีโอสั้น ${duration} วินาที สไตล์${style} เรื่อง "${topic}" สำหรับ TikTok/Facebook Reels ภาษาไทย มี Hook 3 วิแรก, เนื้อหา, CTA ท้าย แบ่งเป็น [HOOK] [CONTENT] [CTA] ชัดเจน` }] }] })
       })
       const data = await res.json()
-      setScript(data.candidates?.[0]?.content?.parts?.[0]?.text || 'ไม่สามารถสร้างได้')
+      const script = data.candidates?.[0]?.content?.parts?.[0]?.text || 'ไม่สามารถสร้างได้'
+      setProject({ topic, script, title: topic })
     } catch { setError('เกิดข้อผิดพลาด ลองใหม่') }
     setLoading(false)
+  }
+
+  async function handleSaveAndNext() {
+    setSaving(true)
+    await saveProject()
+    setSaving(false)
+    router.push('/dashboard/storyboard')
   }
 
   return (
@@ -32,6 +45,7 @@ export default function ScriptPage() {
       <header className="border-b border-white/10 px-6 py-4 flex items-center gap-4">
         <Link href="/dashboard" className="text-gray-400 hover:text-white">← กลับ</Link>
         <span className="font-bold text-white text-xl">📝 Script AI</span>
+        {project.script && <span className="ml-auto text-xs text-green-400">● มีสคริปต์แล้ว</span>}
       </header>
       <main className="max-w-3xl mx-auto px-4 py-10 space-y-5">
         <div>
@@ -41,7 +55,7 @@ export default function ScriptPage() {
         </div>
         <div className="grid grid-cols-2 gap-4">
           <div>
-            <label className="block text-sm text-gray-400 mb-2">ความยาว (วินาที)</label>
+            <label className="block text-sm text-gray-400 mb-2">ความยาว</label>
             <select value={duration} onChange={e => setDuration(e.target.value)}
               className="w-full px-4 py-3 rounded-xl bg-white/5 border border-white/10 text-white focus:outline-none focus:border-purple-500">
               <option value="30">30 วินาที</option>
@@ -64,13 +78,21 @@ export default function ScriptPage() {
           style={{background:'linear-gradient(90deg,#7C3AED,#4F46E5)'}}>
           {loading ? '⏳ กำลังสร้างสคริปต์...' : '✍️ สร้างสคริปต์'}
         </button>
-        {script && (
-          <div className="p-6 rounded-xl whitespace-pre-wrap text-gray-200 text-sm leading-relaxed" style={{background:'rgba(255,255,255,0.04)',border:'1px solid rgba(255,255,255,0.08)'}}>
-            {script}
-            <button onClick={() => navigator.clipboard.writeText(script)}
-              className="mt-4 px-4 py-2 rounded-lg text-sm border border-white/10 text-gray-300 hover:bg-white/5 block">
-              📋 Copy สคริปต์
-            </button>
+
+        {project.script && (
+          <div className="p-6 rounded-xl" style={{background:'rgba(255,255,255,0.04)',border:'1px solid rgba(255,255,255,0.08)'}}>
+            <div className="whitespace-pre-wrap text-gray-200 text-sm leading-relaxed mb-4">{project.script}</div>
+            <div className="flex gap-3">
+              <button onClick={() => navigator.clipboard.writeText(project.script)}
+                className="px-4 py-2 rounded-lg text-sm border border-white/10 text-gray-300 hover:bg-white/5">
+                📋 Copy
+              </button>
+              <button onClick={handleSaveAndNext} disabled={saving}
+                className="px-4 py-2 rounded-lg text-sm font-semibold text-white disabled:opacity-50"
+                style={{background:'linear-gradient(90deg,#7C3AED,#4F46E5)'}}>
+                {saving ? '⏳ กำลังบันทึก...' : '🎬 บันทึก → ไป Storyboard'}
+              </button>
+            </div>
           </div>
         )}
       </main>

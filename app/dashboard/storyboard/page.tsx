@@ -1,9 +1,13 @@
 'use client'
 import { useState } from 'react'
 import Link from 'next/link'
+import { useRouter } from 'next/navigation'
+import { useStore } from '@/lib/store'
 
 export default function StoryboardPage() {
-  const [script, setScript] = useState('')
+  const router = useRouter()
+  const { project, setProject, saveProject } = useStore()
+  const [script, setScript] = useState(project.script || '')
   const [loading, setLoading] = useState(false)
   const [scenes, setScenes] = useState<any[]>([])
   const [error, setError] = useState('')
@@ -22,8 +26,12 @@ export default function StoryboardPage() {
       const data = await res.json()
       const text = data.candidates?.[0]?.content?.parts?.[0]?.text || ''
       const json = text.match(/\[[\s\S]*\]/)
-      if (json) setScenes(JSON.parse(json[0]))
-      else setError('ไม่สามารถสร้างได้ ลองใหม่')
+      if (json) {
+        const parsed = JSON.parse(json[0])
+        setScenes(parsed)
+        setProject({ storyboard: parsed })
+        await saveProject()
+      } else setError('ไม่สามารถสร้างได้ ลองใหม่')
     } catch { setError('เกิดข้อผิดพลาด') }
     setLoading(false)
   }

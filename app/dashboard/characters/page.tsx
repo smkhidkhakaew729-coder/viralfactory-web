@@ -1,9 +1,11 @@
 'use client'
 import { useState } from 'react'
 import Link from 'next/link'
+import { useStore } from '@/lib/store'
 
 export default function CharactersPage() {
-  const [story, setStory] = useState('')
+  const { project, setProject, saveProject } = useStore()
+  const [story, setStory] = useState(project.topic || '')
   const [loading, setLoading] = useState(false)
   const [chars, setChars] = useState<any[]>([])
   const [error, setError] = useState('')
@@ -21,8 +23,12 @@ export default function CharactersPage() {
       const data = await res.json()
       const text = data.candidates?.[0]?.content?.parts?.[0]?.text || ''
       const json = text.match(/\[[\s\S]*\]/)
-      if (json) setChars(JSON.parse(json[0]))
-      else setError('ไม่สามารถสร้างได้')
+      if (json) {
+        const parsed = JSON.parse(json[0])
+        setChars(parsed)
+        setProject({ characters: parsed })
+        await saveProject()
+      } else setError('ไม่สามารถสร้างได้')
     } catch { setError('เกิดข้อผิดพลาด') }
     setLoading(false)
   }
