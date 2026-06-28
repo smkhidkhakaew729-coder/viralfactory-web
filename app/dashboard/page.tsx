@@ -20,6 +20,7 @@ const features = [
   { icon: '✂️', label: 'Video Editor', desc: 'ตัดต่อวิดีโอ', href: '/dashboard/editor' },
   { icon: '🚀', label: 'Auto-Post', desc: 'โพสต์ Facebook อัตโนมัติ', href: '/dashboard/autopost' },
   { icon: '⚡', label: 'Auto Pipeline', desc: 'กดเดียว AI ทำทุกอย่างเอง', href: '/dashboard/autopipeline' },
+  { icon: '🎬', label: 'Studio', desc: 'Script→เสียง→ซับ→B-Roll→โพสต์', href: '/dashboard/studio' },
 ]
 
 export default function DashboardPage() {
