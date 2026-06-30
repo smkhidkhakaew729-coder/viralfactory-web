@@ -5,9 +5,8 @@ import { createClient } from '@/lib/supabase'
 import type { User } from '@supabase/supabase-js'
 
 type Phase = 'idle' | 'running' | 'preview' | 'exporting' | 'done'
-
 interface Sub { text: string; start: number; end: number }
-interface BRoll { query: string; thumb: string; url: string; blob?: Blob }
+interface BRoll { query: string; thumb: string; url: string }
 
 export default function DashboardPage() {
   const router = useRouter()
@@ -15,6 +14,7 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(true)
   const [topic, setTopic] = useState('')
   const [gemKey, setGemKey] = useState('')
+  const [googleTTSKey, setGoogleTTSKey] = useState('')
   const [pexelsKey, setPexelsKey] = useState('')
   const [fbToken, setFbToken] = useState('')
   const [showSettings, setShowSettings] = useState(false)
@@ -23,26 +23,23 @@ export default function DashboardPage() {
   const [script, setScript] = useState('')
   const [subs, setSubs] = useState<Sub[]>([])
   const [brolls, setBrolls] = useState<BRoll[]>([])
+  const [audioUrl, setAudioUrl] = useState('')
   const [audioBlob, setAudioBlob] = useState<Blob | null>(null)
+  const [caption, setCaption] = useState('')
   const [videoUrl, setVideoUrl] = useState('')
   const [exportProgress, setExportProgress] = useState(0)
-  const [caption, setCaption] = useState('')
-  const [currentSub, setCurrentSub] = useState('')
-  const [currentBroll, setCurrentBroll] = useState(0)
-  const videoRef = useRef<HTMLVideoElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
-  const previewRef = useRef<HTMLVideoElement>(null)
   const logRef = useRef<HTMLDivElement>(null)
 
   const addLog = (msg: string) => setLog(prev => [...prev, msg])
 
   useEffect(() => {
-    const supabase = createClient()
-    supabase.auth.getUser().then(({ data }) => {
+    createClient().auth.getUser().then(({ data }) => {
       if (!data.user) router.push('/login')
       else { setUser(data.user); setLoading(false) }
     })
     setGemKey(localStorage.getItem('vf_gemini_key') || '')
+    setGoogleTTSKey(localStorage.getItem('vf_google_tts_key') || '')
     setPexelsKey(localStorage.getItem('vf_pexels_key') || '')
     setFbToken(localStorage.getItem('vf_fb_token') || '')
   }, [router])
@@ -53,6 +50,7 @@ export default function DashboardPage() {
 
   function saveSettings() {
     localStorage.setItem('vf_gemini_key', gemKey)
+    localStorage.setItem('vf_google_tts_key', googleTTSKey)
     localStorage.setItem('vf_pexels_key', pexelsKey)
     localStorage.setItem('vf_fb_token', fbToken)
     setShowSettings(false)
@@ -65,81 +63,104 @@ export default function DashboardPage() {
         body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }) }
     )
     const d = await res.json()
+    if (d.error) throw new Error(d.error.message)
     return d.candidates?.[0]?.content?.parts?.[0]?.text || ''
   }
 
-  // TTS via browser SpeechSynthesis → record to AudioContext → Blob
-  async function recordTTS(text: string): Promise<Blob> {
-    return new Promise((resolve, reject) => {
-      try {
-        const ctx = new AudioContext()
-        const dest = ctx.createMediaStreamDestination()
-        const rec = new MediaRecorder(dest.stream, { mimeType: 'audio/webm' })
-        const chunks: BlobPart[] = []
-        rec.ondataavailable = e => chunks.push(e.data)
-        rec.onstop = () => resolve(new Blob(chunks, { type: 'audio/webm' }))
-        rec.start()
-        const utt = new SpeechSynthesisUtterance(text)
-        const voices = speechSynthesis.getVoices()
-        const th = voices.find(v => v.lang.startsWith('th'))
-        if (th) { utt.voice = th; utt.lang = th.lang }
-        utt.rate = 1.05
-        utt.onend = () => { setTimeout(() => rec.stop(), 300) }
-        utt.onerror = () => reject(new Error('TTS error'))
-        speechSynthesis.speak(utt)
-      } catch (e) { reject(e) }
-    })
+  // Google Cloud TTS → mp3 blob
+  async function googleTTS(text: string): Promise<Blob> {
+    const res = await fetch(
+      `https://texttospeech.googleapis.com/v1/text:synthesize?key=${googleTTSKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          input: { text },
+          voice: {
+            languageCode: 'th-TH',
+            name: 'th-TH-Neural2-C',  // เสียงผู้หญิงไทย Neural2
+            ssmlGender: 'FEMALE'
+          },
+          audioConfig: {
+            audioEncoding: 'MP3',
+            speakingRate: 1.05,
+            pitch: 0
+          }
+        })
+      }
+    )
+    const d = await res.json()
+    if (d.error) throw new Error(`Google TTS: ${d.error.message}`)
+    // audioContent คือ base64 mp3
+    const b64 = d.audioContent
+    const bin = atob(b64)
+    const bytes = new Uint8Array(bin.length)
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+    return new Blob([bytes], { type: 'audio/mpeg' })
   }
 
   async function runPipeline() {
     if (!topic.trim() || !gemKey) { setShowSettings(true); return }
+    if (!googleTTSKey) { setShowSettings(true); alert('กรุณาใส่ Google TTS API Key ก่อน'); return }
+
     setPhase('running')
     setLog([])
-    setScript(''); setSubs([]); setBrolls([]); setAudioBlob(null); setVideoUrl(''); setCaption('')
+    setScript(''); setSubs([]); setBrolls([])
+    setAudioUrl(''); setAudioBlob(null); setVideoUrl(''); setCaption('')
 
     try {
       // 1. Script
-      addLog('📝 กำลังเขียนสคริปต์ด้วย AI...')
-      const sc = await gem(`เขียนสคริปต์วิดีโอ TikTok 45-60 วินาที เรื่อง "${topic}" ภาษาไทย มี Hook ดึงดูด 3 วิแรก เนื้อหากระชับ และ CTA ท้าย เขียนเป็นประโยคสั้นๆ ต่อเนื่อง ไม่ต้อง label`)
+      addLog('📝 เขียนสคริปต์ด้วย AI...')
+      const sc = await gem(
+        `เขียนสคริปต์วิดีโอ TikTok 45-60 วินาที เรื่อง "${topic}" ภาษาไทย
+มี Hook ดึงดูด 3 วิแรก เนื้อหากระชับ CTA ท้าย
+เขียนเป็นประโยคสั้นๆ ต่อเนื่อง ไม่ต้อง label ไม่ต้องมี emoji`
+      )
       setScript(sc)
       addLog('✅ Script พร้อมแล้ว')
 
-      // 2. Subtitle
-      addLog('💬 สร้างซับไทย...')
-      const subRaw = await gem(`แบ่งข้อความนี้เป็นซับไตเติ้ล ประโยคละ 4-6 คำ ตอบ JSON array เท่านั้น ไม่ต้องมีอะไรอื่น: [{"text":"ข้อความ","start":0,"end":3}] start/end เป็นวินาทีต่อเนื่อง ข้อความ: ${sc}`)
+      // 2. ซับไทย + timing
+      addLog('💬 สร้างซับไทยพร้อม timing...')
+      const subRaw = await gem(
+        `แบ่งข้อความนี้เป็นซับไตเติ้ล ประโยคละ 4-6 คำ
+ตอบ JSON array เท่านั้น ห้ามมีข้อความอื่น:
+[{"text":"ข้อความ","start":0,"end":3},{"text":"ข้อความ2","start":3,"end":6}]
+start/end เป็นวินาทีต่อเนื่อง คำนวณตามความยาวประโยค (เฉลี่ย 2.5 วิต่อประโยค)
+ข้อความ: ${sc}`
+      )
       let parsedSubs: Sub[] = []
       try {
         const m = subRaw.match(/\[[\s\S]*\]/)
         if (m) parsedSubs = JSON.parse(m[0])
       } catch {}
       if (parsedSubs.length === 0) {
-        // fallback: แบ่งเองจากจำนวนคำ
-        const words = sc.split(/\s+/)
+        // fallback
+        const words = sc.replace(/\n/g, ' ').split(/\s+/).filter(Boolean)
         let t = 0
         for (let i = 0; i < words.length; i += 5) {
           const chunk = words.slice(i, i + 5).join(' ')
-          parsedSubs.push({ text: chunk, start: t, end: t + 3 })
-          t += 3
+          parsedSubs.push({ text: chunk, start: t, end: t + 2.5 })
+          t += 2.5
         }
       }
       setSubs(parsedSubs)
       addLog(`✅ ซับ ${parsedSubs.length} บรรทัดพร้อมแล้ว`)
 
-      // 3. TTS Voice
-      addLog('🎙️ กำลังสร้างเสียงพากย์...')
-      let ab: Blob | null = null
-      try {
-        ab = await recordTTS(sc)
-        setAudioBlob(ab)
-        addLog('✅ เสียงพากย์พร้อมแล้ว')
-      } catch {
-        addLog('⚠️ เสียงพากย์ไม่ได้ (browser ไม่รองรับ recording) — จะใช้เสียงในตอน preview')
-      }
+      // 3. Google TTS
+      addLog('🎙️ สร้างเสียงพากย์ด้วย Google TTS (ภาษาไทย)...')
+      const ab = await googleTTS(sc)
+      setAudioBlob(ab)
+      setAudioUrl(URL.createObjectURL(ab))
+      addLog('✅ เสียงพากย์พร้อมแล้ว')
 
-      // 4. B-Roll keywords + fetch
-      addLog('🎬 กำลังหา B-Roll วิดีโอ...')
-      const kwRaw = await gem(`จากสคริปต์นี้ หา 5 keyword ภาษาอังกฤษสำหรับหา B-roll video ใน Pexels เป็น vertical/portrait video ตอบ JSON array เท่านั้น: ["kw1","kw2","kw3","kw4","kw5"] สคริปต์: ${sc.slice(0, 300)}`)
-      let keywords: string[] = ['business success', 'online shopping', 'smartphone', 'money thailand', 'happy people']
+      // 4. B-Roll
+      addLog('🎬 หา B-Roll วิดีโอ...')
+      const kwRaw = await gem(
+        `จากสคริปต์นี้ หา 5 keyword ภาษาอังกฤษสั้นๆ สำหรับหา B-roll video portrait บน Pexels
+ตอบ JSON array เท่านั้น: ["kw1","kw2","kw3","kw4","kw5"]
+สคริปต์: ${sc.slice(0, 250)}`
+      )
+      let keywords = ['business success', 'online shopping', 'smartphone thailand', 'money', 'happy people']
       try {
         const m = kwRaw.match(/\[[\s\S]*?\]/)
         if (m) keywords = JSON.parse(m[0])
@@ -156,12 +177,12 @@ export default function DashboardPage() {
             const d = await r.json()
             const vid = d.videos?.[0]
             if (vid) {
-              const file = vid.video_files?.find((f: any) => f.quality === 'sd' || f.quality === 'hd')
+              const file = vid.video_files?.find((f: any) => f.quality === 'sd') || vid.video_files?.[0]
               brollList.push({ query: kw, thumb: vid.image, url: file?.link || '' })
             }
           } catch {}
         }
-        addLog(`✅ ได้ B-Roll ${brollList.length} คลิปจาก Pexels`)
+        addLog(`✅ ได้ B-Roll ${brollList.length} คลิป`)
       } else {
         keywords.slice(0, 5).forEach(k => brollList.push({ query: k, thumb: '', url: '' }))
         addLog('⚠️ ไม่มี Pexels Key — จะใช้สีพื้นหลังแทน B-Roll')
@@ -170,11 +191,13 @@ export default function DashboardPage() {
 
       // 5. Caption
       addLog('✍️ สร้าง Caption...')
-      const cap = await gem(`เขียน Caption TikTok/Facebook ไวรัล เรื่อง "${topic}" ภาษาไทย มี emoji hashtag CTA กระชับ ไม่เกิน 5 บรรทัด`)
+      const cap = await gem(
+        `เขียน Caption TikTok/Facebook ไวรัล เรื่อง "${topic}" ภาษาไทย
+มี emoji hashtag CTA ไม่เกิน 5 บรรทัด`
+      )
       setCaption(cap)
-      addLog('✅ Caption พร้อมแล้ว')
+      addLog('✅ ทุกอย่างพร้อม! 🎉')
 
-      addLog('🎉 ทุกอย่างพร้อม! กด "Preview คลิป" ด้านล่างได้เลย')
       setPhase('preview')
 
     } catch (e: any) {
@@ -183,156 +206,177 @@ export default function DashboardPage() {
     }
   }
 
-  // Render video on canvas — combine B-Roll thumbs + subtitle overlay
   async function exportVideo() {
+    if (!canvasRef.current) return
     setPhase('exporting')
     setExportProgress(0)
     addLog('🎬 กำลัง render วิดีโอ...')
 
-    const canvas = canvasRef.current!
+    const canvas = canvasRef.current
     canvas.width = 1080
     canvas.height = 1920
     const ctx = canvas.getContext('2d')!
 
-    const totalDuration = subs.length > 0 ? subs[subs.length - 1].end : 30
+    const totalDuration = subs.length > 0 ? subs[subs.length - 1].end + 1 : 30
     const FPS = 24
-    const totalFrames = totalDuration * FPS
+    const totalFrames = Math.ceil(totalDuration * FPS)
 
     // Load B-Roll images
-    const bgImages: HTMLImageElement[] = []
+    const bgImgs: HTMLImageElement[] = []
     for (const b of brolls) {
       if (b.thumb) {
-        try {
-          const img = new Image()
-          img.crossOrigin = 'anonymous'
-          await new Promise<void>((res, rej) => {
-            img.onload = () => res()
-            img.onerror = () => res() // skip on error
-            img.src = b.thumb
-          })
-          bgImages.push(img)
-        } catch {}
+        const img = new Image()
+        img.crossOrigin = 'anonymous'
+        await new Promise<void>(res => { img.onload = () => res(); img.onerror = () => res(); img.src = b.thumb })
+        bgImgs.push(img)
       }
     }
 
-    // Record canvas stream
-    const stream = canvas.captureStream(FPS)
+    // Canvas stream + audio track
+    const canvasStream = canvas.captureStream(FPS)
 
-    // Add audio if available
-    let audioTrack: MediaStreamTrack | null = null
+    // Play audio + capture its track
+    let audioEl: HTMLAudioElement | null = null
     if (audioBlob) {
+      audioEl = new Audio(audioUrl)
+      audioEl.play()
       try {
-        const audioEl = new Audio(URL.createObjectURL(audioBlob))
-        audioEl.play()
         const aCtx = new AudioContext()
         const src = aCtx.createMediaElementSource(audioEl)
         const dest = aCtx.createMediaStreamDestination()
         src.connect(dest)
         src.connect(aCtx.destination)
-        audioTrack = dest.stream.getAudioTracks()[0]
-        if (audioTrack) stream.addTrack(audioTrack)
+        dest.stream.getAudioTracks().forEach(t => canvasStream.addTrack(t))
       } catch {}
     }
 
-    const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9' : 'video/webm'
-    const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 4_000_000 })
+    const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
+      ? 'video/webm;codecs=vp9,opus'
+      : MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')
+      ? 'video/webm;codecs=vp8,opus'
+      : 'video/webm'
+
+    const recorder = new MediaRecorder(canvasStream, { mimeType, videoBitsPerSecond: 4_000_000 })
     const chunks: BlobPart[] = []
-    recorder.ondataavailable = e => chunks.push(e.data)
+    recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data) }
     recorder.onstop = () => {
+      audioEl?.pause()
       const blob = new Blob(chunks, { type: 'video/webm' })
-      const url = URL.createObjectURL(blob)
-      setVideoUrl(url)
+      setVideoUrl(URL.createObjectURL(blob))
       setPhase('done')
-      addLog('🎉 วิดีโอพร้อมแล้ว! กด Download ได้เลย')
+      addLog('🎉 คลิปพร้อม! กด Download ได้เลย')
     }
 
-    recorder.start()
+    recorder.start(100)
 
-    // Render frames
-    const colors = ['#1a0a2e', '#0a1a2e', '#0a2e1a', '#2e1a0a', '#1a1a0a']
+    const gradColors = [
+      ['#1a0033', '#0a0a1e'],
+      ['#001a33', '#0a1a0a'],
+      ['#1a1a00', '#1a0000'],
+      ['#001a1a', '#0a001a'],
+      ['#0a1a33', '#1a0a00'],
+    ]
+
     for (let frame = 0; frame < totalFrames; frame++) {
       const t = frame / FPS
-      const subIdx = subs.findIndex(s => t >= s.start && t < s.end)
-      const bgIdx = Math.floor((t / totalDuration) * Math.max(bgImages.length, 1)) % Math.max(bgImages.length, 1)
+      const bgIdx = Math.min(Math.floor((t / totalDuration) * Math.max(bgImgs.length, 1)), Math.max(bgImgs.length - 1, 0))
+      const subNow = subs.find(s => t >= s.start && t < s.end)
 
-      // Background
-      if (bgImages[bgIdx]) {
-        ctx.drawImage(bgImages[bgIdx], 0, 0, 1080, 1920)
-        // Dark overlay
-        ctx.fillStyle = 'rgba(0,0,0,0.45)'
-        ctx.fillRect(0, 0, 1080, 1920)
+      // --- Background ---
+      if (bgImgs[bgIdx]) {
+        // Fill canvas maintaining aspect ratio (cover)
+        const img = bgImgs[bgIdx]
+        const scale = Math.max(canvas.width / img.naturalWidth, canvas.height / img.naturalHeight)
+        const w = img.naturalWidth * scale
+        const h = img.naturalHeight * scale
+        ctx.drawImage(img, (canvas.width - w) / 2, (canvas.height - h) / 2, w, h)
+        // Dark vignette overlay
+        const vig = ctx.createLinearGradient(0, 0, 0, canvas.height)
+        vig.addColorStop(0, 'rgba(0,0,0,0.5)')
+        vig.addColorStop(0.4, 'rgba(0,0,0,0.1)')
+        vig.addColorStop(0.7, 'rgba(0,0,0,0.2)')
+        vig.addColorStop(1, 'rgba(0,0,0,0.75)')
+        ctx.fillStyle = vig
+        ctx.fillRect(0, 0, canvas.width, canvas.height)
       } else {
-        const grad = ctx.createLinearGradient(0, 0, 0, 1920)
-        grad.addColorStop(0, colors[bgIdx % colors.length])
-        grad.addColorStop(1, '#09090f')
-        ctx.fillStyle = grad
-        ctx.fillRect(0, 0, 1080, 1920)
+        // Gradient fallback
+        const [c1, c2] = gradColors[bgIdx % gradColors.length]
+        const g = ctx.createLinearGradient(0, 0, 0, canvas.height)
+        g.addColorStop(0, c1); g.addColorStop(1, c2)
+        ctx.fillStyle = g
+        ctx.fillRect(0, 0, canvas.width, canvas.height)
       }
 
-      // Logo watermark top
-      ctx.fillStyle = 'rgba(255,255,255,0.6)'
-      ctx.font = 'bold 36px sans-serif'
+      // --- Top logo bar ---
+      ctx.fillStyle = 'rgba(0,0,0,0.4)'
+      ctx.fillRect(0, 0, canvas.width, 130)
+      ctx.fillStyle = 'rgba(255,255,255,0.9)'
+      ctx.font = 'bold 52px sans-serif'
       ctx.textAlign = 'center'
-      ctx.fillText('⚡ ViralFactory AI', 540, 80)
+      ctx.fillText('⚡ ViralFactory AI', canvas.width / 2, 85)
 
-      // Subtitle bottom
-      if (subIdx >= 0 && subs[subIdx]) {
-        const sub = subs[subIdx]
-        const subText = sub.text
+      // --- Topic text (top area) ---
+      ctx.fillStyle = 'rgba(255,255,255,0.6)'
+      ctx.font = '38px sans-serif'
+      ctx.fillText(topic.slice(0, 30), canvas.width / 2, 140)
 
-        // Box
-        ctx.fillStyle = 'rgba(0,0,0,0.65)'
-        const tw = ctx.measureText(subText).width + 80
+      // --- Subtitle (bottom) ---
+      if (subNow) {
+        const subText = subNow.text
+        ctx.font = 'bold 80px sans-serif'
+        const tw = ctx.measureText(subText).width
+
+        // Box shadow
+        ctx.fillStyle = 'rgba(0,0,0,0.75)'
+        const boxW = tw + 80
+        const boxX = (canvas.width - boxW) / 2
         ctx.beginPath()
-        ctx.roundRect(540 - tw/2, 1650, tw, 110, 16)
+        ;(ctx as any).roundRect?.(boxX, 1660, boxW, 120, 20)
         ctx.fill()
 
         // Text
         ctx.fillStyle = '#ffffff'
-        ctx.font = 'bold 72px sans-serif'
         ctx.textAlign = 'center'
-        ctx.fillText(subText, 540, 1730)
+        ctx.fillText(subText, canvas.width / 2, 1745)
+
+        // Purple underline accent
+        ctx.fillStyle = '#7C3AED'
+        ctx.fillRect((canvas.width - tw) / 2, 1760, tw, 6)
       }
 
-      // Progress bar bottom
+      // --- Progress bar ---
       const prog = t / totalDuration
-      ctx.fillStyle = 'rgba(255,255,255,0.15)'
-      ctx.fillRect(0, 1900, 1080, 20)
-      ctx.fillStyle = 'rgba(124,58,237,0.9)'
-      ctx.fillRect(0, 1900, 1080 * prog, 20)
+      ctx.fillStyle = 'rgba(255,255,255,0.12)'
+      ctx.fillRect(0, canvas.height - 16, canvas.width, 16)
+      const barGrad = ctx.createLinearGradient(0, 0, canvas.width * prog, 0)
+      barGrad.addColorStop(0, '#7C3AED')
+      barGrad.addColorStop(1, '#4F46E5')
+      ctx.fillStyle = barGrad
+      ctx.fillRect(0, canvas.height - 16, canvas.width * prog, 16)
 
-      // Wait for next frame
       await new Promise(r => setTimeout(r, 1000 / FPS))
       setExportProgress(Math.round((frame / totalFrames) * 100))
     }
 
+    await new Promise(r => setTimeout(r, 500))
     recorder.stop()
   }
 
   function downloadVideo() {
     const a = document.createElement('a')
     a.href = videoUrl
-    a.download = `${topic || 'viral-clip'}.webm`
+    a.download = `${topic || 'viral'}.webm`
     a.click()
-  }
-
-  function downloadCaption() {
-    const txt = `หัวข้อ: ${topic}\n\n--- SCRIPT ---\n${script}\n\n--- CAPTION ---\n${caption}`
-    const a = document.createElement('a')
-    a.href = URL.createObjectURL(new Blob([txt], { type: 'text/plain;charset=utf-8' }))
-    a.download = `${topic}.txt`; a.click()
   }
 
   if (loading) return (
     <div className="min-h-screen flex items-center justify-center" style={{ background: '#09090f' }}>
-      <div className="text-purple-400 text-sm animate-pulse">⚡ กำลังโหลด...</div>
+      <div className="text-purple-400 animate-pulse">⚡ กำลังโหลด...</div>
     </div>
   )
 
   return (
     <div className="min-h-screen" style={{ background: '#09090f' }}>
-
-      {/* Hidden canvas for rendering */}
       <canvas ref={canvasRef} style={{ display: 'none' }} />
 
       {/* Header */}
@@ -344,8 +388,7 @@ export default function DashboardPage() {
           <span className="font-black text-white">ViralFactory AI</span>
         </div>
         <div className="flex items-center gap-2">
-          <span className="text-gray-600 text-xs hidden sm:block">{user?.email}</span>
-          <button onClick={() => setShowSettings(true)} className="p-2 rounded-lg text-gray-400 hover:text-white hover:bg-white/5 transition text-lg">⚙️</button>
+          <button onClick={() => setShowSettings(true)} className="p-2 rounded-lg text-gray-400 hover:text-white hover:bg-white/5 transition">⚙️</button>
           <button onClick={async () => { await createClient().auth.signOut(); router.push('/') }}
             className="px-3 py-1.5 rounded-lg text-xs text-gray-500 hover:text-gray-300 hover:bg-white/5 transition">ออก</button>
         </div>
@@ -353,21 +396,23 @@ export default function DashboardPage() {
 
       {/* Settings Modal */}
       {showSettings && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(0,0,0,0.75)', backdropFilter: 'blur(4px)' }}>
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          style={{ background: 'rgba(0,0,0,0.8)', backdropFilter: 'blur(4px)' }}>
           <div className="w-full max-w-md rounded-2xl p-6 space-y-4" style={{ background: '#141420', border: '1px solid rgba(255,255,255,0.1)' }}>
             <div className="flex justify-between items-center">
-              <h3 className="text-white font-bold text-lg">⚙️ Settings — API Keys</h3>
+              <h3 className="text-white font-bold text-lg">⚙️ Settings</h3>
               <button onClick={() => setShowSettings(false)} className="text-gray-500 hover:text-white text-xl">✕</button>
             </div>
             {[
-              { label: 'Gemini API Key *จำเป็น', val: gemKey, set: setGemKey, ph: 'AIza...', link: 'https://aistudio.google.com/app/apikey', note: 'สำหรับเขียน Script + ซับ + Caption' },
-              { label: 'Pexels API Key (B-Roll)', val: pexelsKey, set: setPexelsKey, ph: 'xxxxxx...', link: 'https://www.pexels.com/api/', note: 'สำหรับดึงวิดีโอพื้นหลัง ฟรี' },
+              { label: 'Gemini API Key *', val: gemKey, set: setGemKey, ph: 'AIza...', link: 'https://aistudio.google.com/app/apikey', note: 'เขียน Script + ซับ + Caption (ฟรี)' },
+              { label: 'Google TTS API Key * (เสียงพากย์)', val: googleTTSKey, set: setGoogleTTSKey, ph: 'AIza...', link: 'https://console.cloud.google.com/apis/library/texttospeech.googleapis.com', note: 'เปิด Text-to-Speech API ใน Google Cloud → ใช้ key เดียวกับ Gemini ได้เลย' },
+              { label: 'Pexels API Key (B-Roll)', val: pexelsKey, set: setPexelsKey, ph: 'xxxxxx...', link: 'https://www.pexels.com/api/', note: 'วิดีโอพื้นหลัง ฟรี' },
               { label: 'Facebook Token (โพสต์)', val: fbToken, set: setFbToken, ph: 'EAAxxxxx...', link: 'https://developers.facebook.com/tools/explorer/', note: 'สำหรับโพสต์ Facebook' },
             ].map(f => (
               <div key={f.label}>
                 <div className="flex justify-between mb-1">
-                  <label className="text-sm text-gray-300 font-semibold">{f.label}</label>
-                  <a href={f.link} target="_blank" rel="noreferrer" className="text-purple-400 text-xs">รับฟรี →</a>
+                  <label className="text-sm text-gray-200 font-semibold">{f.label}</label>
+                  <a href={f.link} target="_blank" rel="noreferrer" className="text-purple-400 text-xs">เปิด →</a>
                 </div>
                 <input value={f.val} onChange={e => f.set(e.target.value)} placeholder={f.ph}
                   className="w-full px-3 py-2.5 rounded-xl text-white text-sm placeholder-gray-600 focus:outline-none focus:border-purple-500 mb-1"
@@ -375,9 +420,10 @@ export default function DashboardPage() {
                 <p className="text-gray-600 text-xs">{f.note}</p>
               </div>
             ))}
-            <button onClick={saveSettings}
-              className="w-full py-3 rounded-xl font-semibold text-white"
-              style={{ background: 'linear-gradient(90deg,#7C3AED,#4F46E5)' }}>
+            <div className="p-3 rounded-xl text-yellow-300 text-xs" style={{ background: 'rgba(234,179,8,0.1)', border: '1px solid rgba(234,179,8,0.2)' }}>
+              💡 <strong>Google TTS:</strong> ไปที่ console.cloud.google.com → เปิด "Cloud Text-to-Speech API" → สร้าง API Key → นำมาใส่ที่นี่ (ฟรี 1 ล้าน characters/เดือน)
+            </div>
+            <button onClick={saveSettings} className="w-full py-3 rounded-xl font-semibold text-white" style={{ background: 'linear-gradient(90deg,#7C3AED,#4F46E5)' }}>
               บันทึก
             </button>
           </div>
@@ -387,9 +433,9 @@ export default function DashboardPage() {
       <main className="max-w-2xl mx-auto px-4 py-8 space-y-5">
 
         {/* Hero */}
-        <div className="text-center py-4">
+        <div className="text-center">
           <h1 className="text-white font-black text-3xl mb-2">🎬 สร้างคลิปไวรัล</h1>
-          <p className="text-gray-500 text-sm">ใส่หัวข้อ → AI เขียน Script + เสียงพากย์ + ซับไทย + B-Roll → Export .webm</p>
+          <p className="text-gray-500 text-sm">AI เขียน Script → Google TTS เสียงไทย → ซับ → B-Roll → Export .webm</p>
         </div>
 
         {/* Input */}
@@ -397,58 +443,65 @@ export default function DashboardPage() {
           <div className="flex gap-3">
             <input value={topic} onChange={e => setTopic(e.target.value)}
               onKeyDown={e => e.key === 'Enter' && phase === 'idle' && runPipeline()}
-              placeholder="หัวข้อ เช่น วิธีรวยจาก TikTok, รีวิวสินค้า, แม่ค้าออนไลน์..."
+              placeholder="หัวข้อ เช่น วิธีรวยจาก TikTok, รีวิวสินค้า..."
               disabled={phase === 'running' || phase === 'exporting'}
-              className="flex-1 px-4 py-3.5 rounded-xl text-white placeholder-gray-600 focus:outline-none focus:border-purple-500 disabled:opacity-50"
+              className="flex-1 px-4 py-3.5 rounded-xl text-white placeholder-gray-600 focus:outline-none disabled:opacity-50"
               style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.1)' }} />
-            <button onClick={runPipeline}
-              disabled={!topic.trim() || phase === 'running' || phase === 'exporting'}
+            <button onClick={runPipeline} disabled={!topic.trim() || phase === 'running' || phase === 'exporting'}
               className="px-5 py-3.5 rounded-xl font-bold text-white disabled:opacity-40 whitespace-nowrap"
               style={{ background: 'linear-gradient(90deg,#7C3AED,#4F46E5)', boxShadow: '0 0 20px rgba(124,58,237,0.35)' }}>
               {phase === 'running' ? '⏳ AI ทำงาน...' : '⚡ สร้างคลิป!'}
             </button>
           </div>
-          {!gemKey && (
-            <p className="mt-2 text-yellow-500 text-xs">⚠️ ต้องใส่ Gemini Key ก่อน — <button onClick={() => setShowSettings(true)} className="underline">เปิด Settings</button></p>
+          {(!gemKey || !googleTTSKey) && (
+            <p className="mt-2 text-yellow-400 text-xs">⚠️ ต้องใส่ Gemini Key + Google TTS Key — <button onClick={() => setShowSettings(true)} className="underline font-semibold">เปิด Settings</button></p>
           )}
         </div>
 
         {/* Log */}
         {log.length > 0 && (
-          <div ref={logRef} className="rounded-2xl p-4 space-y-1 max-h-48 overflow-y-auto"
-            style={{ background: 'rgba(0,0,0,0.4)', border: '1px solid rgba(255,255,255,0.07)', scrollbarWidth: 'thin' }}>
+          <div ref={logRef} className="rounded-2xl p-4 space-y-1 max-h-44 overflow-y-auto font-mono"
+            style={{ background: 'rgba(0,0,0,0.5)', border: '1px solid rgba(255,255,255,0.07)', scrollbarWidth: 'thin' }}>
             {log.map((l, i) => (
-              <div key={i} className="text-sm font-mono"
-                style={{ color: l.startsWith('✅') ? '#4ade80' : l.startsWith('❌') ? '#f87171' : l.startsWith('⚠️') ? '#fbbf24' : l.startsWith('🎉') ? '#a78bfa' : '#94a3b8' }}>
-                {l}
-              </div>
+              <div key={i} className="text-sm" style={{
+                color: l.startsWith('✅') ? '#4ade80' : l.startsWith('❌') ? '#f87171'
+                  : l.startsWith('⚠️') ? '#fbbf24' : l.startsWith('🎉') ? '#a78bfa' : '#94a3b8'
+              }}>{l}</div>
             ))}
             {phase === 'running' && <div className="text-purple-400 text-sm animate-pulse">⏳ กำลังประมวลผล...</div>}
           </div>
         )}
 
-        {/* Preview section */}
+        {/* Preview */}
         {(phase === 'preview' || phase === 'exporting' || phase === 'done') && (
           <div className="space-y-4">
 
-            {/* Script preview */}
+            {/* Audio player */}
+            {audioUrl && (
+              <div className="rounded-2xl p-5" style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)' }}>
+                <h3 className="text-white font-bold text-sm mb-3">🎙️ เสียงพากย์ (Google TTS ภาษาไทย)</h3>
+                <audio src={audioUrl} controls className="w-full" style={{ filter: 'invert(0.85) hue-rotate(200deg)' }} />
+              </div>
+            )}
+
+            {/* Script */}
             {script && (
               <div className="rounded-2xl p-5" style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)' }}>
-                <div className="flex justify-between items-center mb-3">
+                <div className="flex justify-between mb-3">
                   <h3 className="text-white font-bold text-sm">📝 Script</h3>
-                  <button onClick={() => navigator.clipboard.writeText(script)} className="text-purple-400 text-xs hover:text-purple-300">📋 คัดลอก</button>
+                  <button onClick={() => navigator.clipboard.writeText(script)} className="text-purple-400 text-xs">📋 คัดลอก</button>
                 </div>
                 <p className="text-gray-300 text-sm leading-relaxed">{script}</p>
               </div>
             )}
 
-            {/* Subs preview */}
+            {/* Subs */}
             {subs.length > 0 && (
               <div className="rounded-2xl p-5" style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)' }}>
                 <h3 className="text-white font-bold text-sm mb-3">💬 ซับไทย ({subs.length} บรรทัด)</h3>
-                <div className="space-y-1.5 max-h-40 overflow-y-auto">
+                <div className="space-y-1.5 max-h-36 overflow-y-auto">
                   {subs.map((s, i) => (
-                    <div key={i} className="flex items-center gap-3 text-xs">
+                    <div key={i} className="flex gap-3 text-xs">
                       <span className="text-purple-400 font-mono w-16 shrink-0">{s.start}s–{s.end}s</span>
                       <span className="text-gray-300">{s.text}</span>
                     </div>
@@ -458,15 +511,15 @@ export default function DashboardPage() {
             )}
 
             {/* B-Roll thumbs */}
-            {brolls.length > 0 && (
+            {brolls.filter(b => b.thumb).length > 0 && (
               <div className="rounded-2xl p-5" style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)' }}>
-                <h3 className="text-white font-bold text-sm mb-3">🎬 B-Roll วิดีโอ ({brolls.length} คลิป)</h3>
+                <h3 className="text-white font-bold text-sm mb-3">🎬 B-Roll ({brolls.length} คลิป)</h3>
                 <div className="grid grid-cols-5 gap-2">
                   {brolls.map((b, i) => (
-                    <div key={i} className="rounded-xl overflow-hidden aspect-[9/16]" style={{ border: '1px solid rgba(255,255,255,0.08)' }}>
+                    <div key={i} className="rounded-xl overflow-hidden" style={{ aspectRatio: '9/16', border: '1px solid rgba(255,255,255,0.08)' }}>
                       {b.thumb
                         ? <img src={b.thumb} alt={b.query} className="w-full h-full object-cover" />
-                        : <div className="w-full h-full flex items-center justify-center text-xs text-gray-600" style={{ background: 'rgba(255,255,255,0.03)' }}>🎬</div>}
+                        : <div className="w-full h-full flex items-center justify-center text-gray-600 text-xs" style={{ background: 'rgba(255,255,255,0.03)' }}>🎬</div>}
                     </div>
                   ))}
                 </div>
@@ -476,58 +529,37 @@ export default function DashboardPage() {
             {/* Caption */}
             {caption && (
               <div className="rounded-2xl p-5" style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)' }}>
-                <div className="flex justify-between items-center mb-3">
+                <div className="flex justify-between mb-3">
                   <h3 className="text-white font-bold text-sm">✍️ Caption</h3>
-                  <button onClick={() => navigator.clipboard.writeText(caption)} className="text-purple-400 text-xs hover:text-purple-300">📋 คัดลอก</button>
+                  <button onClick={() => navigator.clipboard.writeText(caption)} className="text-purple-400 text-xs">📋 คัดลอก</button>
                 </div>
                 <p className="text-gray-300 text-sm whitespace-pre-line">{caption}</p>
               </div>
             )}
 
-            {/* Phone preview mockup */}
-            {phase === 'preview' && brolls.length > 0 && (
-              <div className="rounded-2xl p-5" style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)' }}>
-                <h3 className="text-white font-bold text-sm mb-4">📱 Preview คลิป (9:16)</h3>
-                <div className="flex justify-center">
-                  <div className="relative w-44 rounded-3xl overflow-hidden" style={{ aspectRatio: '9/16', border: '2px solid rgba(255,255,255,0.15)' }}>
-                    {brolls[0]?.thumb && <img src={brolls[0].thumb} alt="" className="absolute inset-0 w-full h-full object-cover" />}
-                    <div className="absolute inset-0" style={{ background: 'linear-gradient(to top, rgba(0,0,0,0.7) 0%, transparent 50%)' }} />
-                    {subs[0] && (
-                      <div className="absolute bottom-12 left-0 right-0 text-center px-2">
-                        <span className="inline-block bg-black/70 text-white text-xs font-bold px-2 py-1 rounded">{subs[0].text}</span>
-                      </div>
-                    )}
-                    <div className="absolute top-3 left-0 right-0 text-center">
-                      <span className="text-white text-xs font-bold opacity-80">⚡ ViralFactory</span>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* Export */}
+            {/* Export progress */}
             {phase === 'exporting' && (
               <div className="rounded-2xl p-5" style={{ background: 'rgba(124,58,237,0.1)', border: '1px solid rgba(124,58,237,0.25)' }}>
                 <div className="flex justify-between text-sm mb-3">
-                  <span className="text-purple-300 font-semibold">🎬 กำลัง render วิดีโอ...</span>
+                  <span className="text-purple-300 font-semibold">🎬 Rendering วิดีโอ...</span>
                   <span className="text-white font-bold">{exportProgress}%</span>
                 </div>
                 <div className="h-3 rounded-full overflow-hidden" style={{ background: 'rgba(255,255,255,0.08)' }}>
                   <div className="h-full rounded-full transition-all" style={{ width: `${exportProgress}%`, background: 'linear-gradient(90deg,#7C3AED,#4F46E5)' }} />
                 </div>
-                <p className="text-gray-500 text-xs mt-2">กรุณารอสักครู่ — อย่าปิดหน้าต่างนี้</p>
+                <p className="text-gray-500 text-xs mt-2">อย่าปิดหน้าต่าง — กำลัง render frame by frame</p>
               </div>
             )}
 
-            {/* Done */}
+            {/* Video done */}
             {phase === 'done' && videoUrl && (
-              <div className="rounded-2xl p-5 space-y-4" style={{ background: 'rgba(16,185,129,0.08)', border: '1px solid rgba(16,185,129,0.25)' }}>
-                <h3 className="text-green-300 font-bold">🎉 คลิปพร้อมแล้ว!</h3>
-                <video src={videoUrl} controls className="w-full rounded-xl max-h-96" style={{ background: '#000' }} />
+              <div className="rounded-2xl p-5 space-y-4" style={{ background: 'rgba(16,185,129,0.06)', border: '1px solid rgba(16,185,129,0.2)' }}>
+                <h3 className="text-green-300 font-bold">🎉 คลิปพร้อมแล้ว — มีเสียงพากย์ภาษาไทย!</h3>
+                <video src={videoUrl} controls className="w-full rounded-xl" style={{ maxHeight: '400px', background: '#000' }} />
                 <button onClick={downloadVideo}
                   className="w-full py-4 rounded-xl font-bold text-white text-lg"
                   style={{ background: 'linear-gradient(90deg,#7C3AED,#4F46E5)', boxShadow: '0 0 20px rgba(124,58,237,0.4)' }}>
-                  ⬇️ Download คลิป (.webm)
+                  ⬇️ Download คลิป .webm
                 </button>
               </div>
             )}
@@ -536,32 +568,22 @@ export default function DashboardPage() {
             {phase === 'preview' && (
               <div className="space-y-3">
                 <button onClick={exportVideo}
-                  className="w-full py-4 rounded-xl font-bold text-white text-lg transition hover:opacity-90"
+                  className="w-full py-4 rounded-xl font-bold text-white text-lg"
                   style={{ background: 'linear-gradient(90deg,#7C3AED,#4F46E5)', boxShadow: '0 0 20px rgba(124,58,237,0.35)' }}>
-                  🎬 Render เป็นคลิป .webm
-                </button>
-                <button onClick={downloadCaption}
-                  className="w-full py-3 rounded-xl font-semibold border border-white/10 text-gray-300 hover:bg-white/5 transition">
-                  ⬇️ Download Script + Caption (.txt)
+                  🎬 Render คลิป .webm (มีเสียงพากย์)
                 </button>
                 <button onClick={() => { setPhase('idle'); setLog([]) }}
-                  className="w-full py-2.5 rounded-xl text-sm text-gray-600 hover:text-gray-400 transition">
+                  className="w-full py-2.5 rounded-xl text-sm text-gray-600 hover:text-gray-400 border border-white/5 transition">
                   🔄 เริ่มใหม่
                 </button>
               </div>
             )}
 
             {phase === 'done' && (
-              <div className="space-y-3">
-                <button onClick={downloadCaption}
-                  className="w-full py-3 rounded-xl font-semibold border border-white/10 text-gray-300 hover:bg-white/5 transition">
-                  ⬇️ Download Script + Caption (.txt)
-                </button>
-                <button onClick={() => { setPhase('idle'); setLog([]); setVideoUrl('') }}
-                  className="w-full py-2.5 rounded-xl text-sm text-gray-600 hover:text-gray-400 transition">
-                  🔄 สร้างคลิปใหม่
-                </button>
-              </div>
+              <button onClick={() => { setPhase('idle'); setLog([]); setVideoUrl('') }}
+                className="w-full py-2.5 rounded-xl text-sm text-gray-600 hover:text-gray-400 border border-white/5 transition">
+                🔄 สร้างคลิปใหม่
+              </button>
             )}
           </div>
         )}
