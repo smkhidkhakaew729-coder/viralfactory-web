@@ -14,7 +14,6 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(true)
   const [topic, setTopic] = useState('')
   const [gemKey, setGemKey] = useState('')
-  const [googleTTSKey, setGoogleTTSKey] = useState('')
   const [pexelsKey, setPexelsKey] = useState('')
   const [fbToken, setFbToken] = useState('')
   const [showSettings, setShowSettings] = useState(false)
@@ -39,7 +38,6 @@ export default function DashboardPage() {
       else { setUser(data.user); setLoading(false) }
     })
     setGemKey(localStorage.getItem('vf_gemini_key') || '')
-    setGoogleTTSKey(localStorage.getItem('vf_google_tts_key') || '')
     setPexelsKey(localStorage.getItem('vf_pexels_key') || '')
     setFbToken(localStorage.getItem('vf_fb_token') || '')
   }, [router])
@@ -50,7 +48,6 @@ export default function DashboardPage() {
 
   function saveSettings() {
     localStorage.setItem('vf_gemini_key', gemKey)
-    localStorage.setItem('vf_google_tts_key', googleTTSKey)
     localStorage.setItem('vf_pexels_key', pexelsKey)
     localStorage.setItem('vf_fb_token', fbToken)
     setShowSettings(false)
@@ -67,36 +64,51 @@ export default function DashboardPage() {
     return d.candidates?.[0]?.content?.parts?.[0]?.text || ''
   }
 
-  // Google Cloud TTS → mp3 blob
-  async function googleTTS(text: string): Promise<Blob> {
+  // Gemini TTS → wav blob (ใช้ Gemini API Key เดียวกัน)
+  async function geminiTTS(text: string): Promise<Blob> {
     const res = await fetch(
-      `https://texttospeech.googleapis.com/v1/text:synthesize?key=${googleTTSKey}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${gemKey}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          input: { text },
-          voice: {
-            languageCode: 'th-TH',
-            name: 'th-TH-Neural2-C',  // เสียงผู้หญิงไทย Neural2
-            ssmlGender: 'FEMALE'
-          },
-          audioConfig: {
-            audioEncoding: 'MP3',
-            speakingRate: 1.05,
-            pitch: 0
+          contents: [{ parts: [{ text }] }],
+          generationConfig: {
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: 'Aoede' }
+              }
+            }
           }
         })
       }
     )
     const d = await res.json()
-    if (d.error) throw new Error(`Google TTS: ${d.error.message}`)
-    // audioContent คือ base64 mp3
-    const b64 = d.audioContent
+    if (d.error) throw new Error(`Gemini TTS: ${d.error.message}`)
+    const b64 = d.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data
+    if (!b64) throw new Error('Gemini TTS: ไม่ได้รับเสียงกลับมา')
     const bin = atob(b64)
     const bytes = new Uint8Array(bin.length)
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
-    return new Blob([bytes], { type: 'audio/mpeg' })
+    return new Blob([bytes], { type: 'audio/wav' })
+  }
+
+  // Fallback: Browser TTS record via AudioContext
+  async function browserTTS(text: string): Promise<Blob | null> {
+    return new Promise((resolve) => {
+      try {
+        const utt = new SpeechSynthesisUtterance(text)
+        const vs = speechSynthesis.getVoices()
+        const th = vs.find(v => v.lang.startsWith('th'))
+        if (th) { utt.voice = th; utt.lang = th.lang }
+        utt.rate = 1.05
+        // browser TTS ไม่สามารถ record ได้ตรงๆ — return null แล้ว play ตอน preview
+        speechSynthesis.speak(utt)
+        utt.onend = () => resolve(null)
+        utt.onerror = () => resolve(null)
+      } catch { resolve(null) }
+    })
   }
 
   async function runPipeline() {
@@ -146,12 +158,18 @@ start/end เป็นวินาทีต่อเนื่อง คำนว
       setSubs(parsedSubs)
       addLog(`✅ ซับ ${parsedSubs.length} บรรทัดพร้อมแล้ว`)
 
-      // 3. Google TTS
-      addLog('🎙️ สร้างเสียงพากย์ด้วย Google TTS (ภาษาไทย)...')
-      const ab = await googleTTS(sc)
-      setAudioBlob(ab)
-      setAudioUrl(URL.createObjectURL(ab))
-      addLog('✅ เสียงพากย์พร้อมแล้ว')
+      // 3. Gemini TTS
+      addLog('🎙️ สร้างเสียงพากย์ด้วย Gemini TTS...')
+      try {
+        const ab = await geminiTTS(sc)
+        setAudioBlob(ab)
+        setAudioUrl(URL.createObjectURL(ab))
+        addLog('✅ เสียงพากย์พร้อมแล้ว (Gemini TTS)')
+      } catch (ttsErr: any) {
+        addLog(`⚠️ Gemini TTS ไม่ได้ (${ttsErr.message}) — ใช้ Browser TTS แทน`)
+        await browserTTS(sc)
+        addLog('✅ เสียงพากย์ Browser TTS (ไม่มีในคลิป แต่ฟังได้ตอน preview)')
+      }
 
       // 4. B-Roll
       addLog('🎬 หา B-Roll วิดีโอ...')
@@ -404,10 +422,9 @@ start/end เป็นวินาทีต่อเนื่อง คำนว
               <button onClick={() => setShowSettings(false)} className="text-gray-500 hover:text-white text-xl">✕</button>
             </div>
             {[
-              { label: 'Gemini API Key *', val: gemKey, set: setGemKey, ph: 'AIza...', link: 'https://aistudio.google.com/app/apikey', note: 'เขียน Script + ซับ + Caption (ฟรี)' },
-              { label: 'Google TTS API Key * (เสียงพากย์)', val: googleTTSKey, set: setGoogleTTSKey, ph: 'AIza...', link: 'https://console.cloud.google.com/apis/library/texttospeech.googleapis.com', note: 'เปิด Text-to-Speech API ใน Google Cloud → ใช้ key เดียวกับ Gemini ได้เลย' },
-              { label: 'Pexels API Key (B-Roll)', val: pexelsKey, set: setPexelsKey, ph: 'xxxxxx...', link: 'https://www.pexels.com/api/', note: 'วิดีโอพื้นหลัง ฟรี' },
-              { label: 'Facebook Token (โพสต์)', val: fbToken, set: setFbToken, ph: 'EAAxxxxx...', link: 'https://developers.facebook.com/tools/explorer/', note: 'สำหรับโพสต์ Facebook' },
+              { label: 'Gemini API Key * (Script + TTS + ซับ)', val: gemKey, set: setGemKey, ph: 'AIza...', link: 'https://aistudio.google.com/app/apikey', note: 'ใช้ key เดียวทำทุกอย่าง — เขียน Script, เสียงพากย์ TTS, ซับไทย, Caption (ฟรี)' },
+              { label: 'Pexels API Key (B-Roll วิดีโอพื้นหลัง)', val: pexelsKey, set: setPexelsKey, ph: 'xxxxxx...', link: 'https://www.pexels.com/api/', note: 'ดึงวิดีโอพื้นหลัง ฟรี — ไม่มีก็ใช้สีพื้นหลังแทนได้' },
+              { label: 'Facebook Token (โพสต์อัตโนมัติ)', val: fbToken, set: setFbToken, ph: 'EAAxxxxx...', link: 'https://developers.facebook.com/tools/explorer/', note: 'ใส่ถ้าต้องการโพสต์ Facebook อัตโนมัติ' },
             ].map(f => (
               <div key={f.label}>
                 <div className="flex justify-between mb-1">
@@ -420,8 +437,8 @@ start/end เป็นวินาทีต่อเนื่อง คำนว
                 <p className="text-gray-600 text-xs">{f.note}</p>
               </div>
             ))}
-            <div className="p-3 rounded-xl text-yellow-300 text-xs" style={{ background: 'rgba(234,179,8,0.1)', border: '1px solid rgba(234,179,8,0.2)' }}>
-              💡 <strong>Google TTS:</strong> ไปที่ console.cloud.google.com → เปิด "Cloud Text-to-Speech API" → สร้าง API Key → นำมาใส่ที่นี่ (ฟรี 1 ล้าน characters/เดือน)
+            <div className="p-3 rounded-xl text-purple-300 text-xs" style={{ background: 'rgba(124,58,237,0.1)', border: '1px solid rgba(124,58,237,0.2)' }}>
+              💡 <strong>Gemini Key เดียวพอ!</strong> ใช้สร้าง Script + เสียงพากย์ (Gemini TTS) + ซับไทย + Caption ครบในทีเดียว
             </div>
             <button onClick={saveSettings} className="w-full py-3 rounded-xl font-semibold text-white" style={{ background: 'linear-gradient(90deg,#7C3AED,#4F46E5)' }}>
               บันทึก
@@ -453,8 +470,8 @@ start/end เป็นวินาทีต่อเนื่อง คำนว
               {phase === 'running' ? '⏳ AI ทำงาน...' : '⚡ สร้างคลิป!'}
             </button>
           </div>
-          {(!gemKey || !googleTTSKey) && (
-            <p className="mt-2 text-yellow-400 text-xs">⚠️ ต้องใส่ Gemini Key + Google TTS Key — <button onClick={() => setShowSettings(true)} className="underline font-semibold">เปิด Settings</button></p>
+          {!gemKey && (
+            <p className="mt-2 text-yellow-400 text-xs">⚠️ ต้องใส่ Gemini Key ก่อน — <button onClick={() => setShowSettings(true)} className="underline font-semibold">เปิด Settings</button></p>
           )}
         </div>
 
